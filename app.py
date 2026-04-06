@@ -32,6 +32,11 @@ if start_date >= end_date:
     st.sidebar.error("Start date must be before end date.")
     st.stop()
 
+# Let the user pick a moving-average window
+ma_window = st.sidebar.slider(
+    "Moving Average Window (days)", min_value=5, max_value=200, value=50, step=5
+)
+
 # -- Data download ----------------------------------------
 # We wrap the download in st.cache_data so repeated runs with
 # the same inputs don't re-download every time. The ttl (time-to-live)
@@ -57,18 +62,24 @@ if ticker:
         )
         st.stop()
 
-    # Flatten any multi-level columns that yfinance sometimes returns
+    # Flatten multi-index columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # -- Compute a derived column -------------------------
+    # -- Compute derived columns --------------------------
     df["Daily Return"] = df["Close"].pct_change()
+    df[f"{ma_window}-Day MA"] = df["Close"].rolling(window=ma_window).mean()
+
+    if ma_window > len(df):
+        st.warning(
+            f"{ma_window}-day MA is longer than dataset ({len(df)} days)."
+        )
 
     # -- Key metrics --------------------------------------
     latest_close = float(df["Close"].iloc[-1])
     total_return = float((df["Close"].iloc[-1] / df["Close"].iloc[0]) - 1)
     volatility = float(df["Daily Return"].std())
-    ann_volatility = volatility * math.sqrt(252)  # Annualize: daily sigma * sqrt(trading days)
+    ann_volatility = volatility * math.sqrt(252)
     max_close = float(df["Close"].max())
     min_close = float(df["Close"].min())
 
@@ -76,31 +87,36 @@ if ticker:
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Latest Close", f"${latest_close:,.2f}")
-    col2.metric("1-Year Return", f"{total_return:.2%}")
-    col3.metric("Annualized Volatility (sigma)", f"{ann_volatility:.2%}")
+    col2.metric("Return", f"{total_return:.2%}")
+    col3.metric("Annual Volatility", f"{ann_volatility:.2%}")
 
     col4, col5, _ = st.columns(3)
-    col4.metric("Period High", f"${max_close:,.2f}")
-    col5.metric("Period Low", f"${min_close:,.2f}")
+    col4.metric("High", f"${max_close:,.2f}")
+    col5.metric("Low", f"${min_close:,.2f}")
 
     st.divider()
 
-    # -- Price chart --------------------------------------
-    st.subheader("Closing Price")
+    # -- Chart --------------------------------------------
+    st.subheader("Price & Moving Average")
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df.index, y=df["Close"],
-            mode="lines", name="Close Price",
-            line=dict(width=1.5)
-        )
-    )
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["Close"],
+        mode="lines", name="Close"
+    ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df[f"{ma_window}-Day MA"],
+        mode="lines", name=f"{ma_window}-Day MA",
+        line=dict(dash="dash")
+    ))
+
     fig.update_layout(
-        yaxis_title="Price (USD)", xaxis_title="Date",
-        template="plotly_white", height=450
+        yaxis_title="Price (USD)",
+        xaxis_title="Date",
+        template="plotly_white",
+        height=450
     )
-    # use_container_width is preferred for responsive layout
+
     st.plotly_chart(fig, use_container_width=True)
 
 else:
