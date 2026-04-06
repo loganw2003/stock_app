@@ -381,6 +381,7 @@ def load_data(tickers, start, end):
         all_empty_assets = asset_prices.columns[asset_prices.isna().all()].tolist()
         asset_prices = asset_prices.drop(columns=all_empty_assets, errors="ignore")
 
+        # First fallback: retry still-missing tickers one by one with download()
         retried_frames = []
         for tkr in missing_assets:
             try:
@@ -420,6 +421,36 @@ def load_data(tickers, start, end):
         if retried_frames:
             retry_df = pd.concat(retried_frames, axis=1)
             asset_prices = pd.concat([asset_prices, retry_df], axis=1)
+            asset_prices = asset_prices.loc[:, ~asset_prices.columns.duplicated()]
+            asset_prices = asset_prices.sort_index()
+
+        # Second fallback: Ticker.history() for any still-missing symbols
+        still_missing = [c for c in expected_assets if c not in asset_prices.columns]
+
+        history_retry_frames = []
+        for tkr in still_missing:
+            try:
+                hist = yf.Ticker(tkr).history(
+                    start=start,
+                    end=fetch_end,
+                    auto_adjust=False
+                )
+
+                if hist is not None and not hist.empty:
+                    if "Adj Close" in hist.columns:
+                        s = hist["Adj Close"]
+                    elif "Close" in hist.columns:
+                        s = hist["Close"]
+                    else:
+                        continue
+
+                    history_retry_frames.append(s.rename(tkr))
+            except Exception:
+                pass
+
+        if history_retry_frames:
+            history_retry_df = pd.concat(history_retry_frames, axis=1)
+            asset_prices = pd.concat([asset_prices, history_retry_df], axis=1)
             asset_prices = asset_prices.loc[:, ~asset_prices.columns.duplicated()]
             asset_prices = asset_prices.sort_index()
 
@@ -593,6 +624,7 @@ with tab1:
         st.write("Start date:", start_date)
         st.write("End date:", end_date)
         st.write("Prices shape:", prices.shape)
+        st.write("Final asset columns after cleaning:", asset_cols)
         st.write("Invalid stock tickers:", invalid_tickers)
         st.write("Dropped for missing:", dropped_for_missing)
         st.write("Download errors:", download_errors)
