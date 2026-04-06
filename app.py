@@ -1,9 +1,3 @@
-# app.py
-# -------------------------------------------------------
-# A simple Streamlit stock analysis dashboard.
-# Run with:  uv run streamlit run app.py
-# -------------------------------------------------------
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -100,14 +94,6 @@ def portfolio_sharpe(weights: np.ndarray, mean_returns_annual: np.ndarray, cov_a
     return (portfolio_return(weights, mean_returns_annual) - rf_annual) / vol
 
 
-def portfolio_sortino(portfolio_daily_returns: pd.Series, rf_annual: float) -> float:
-    return sortino_ratio(portfolio_daily_returns, rf_annual)
-
-
-def portfolio_max_drawdown(portfolio_daily_returns: pd.Series) -> float:
-    return max_drawdown_from_returns(portfolio_daily_returns)
-
-
 def risk_contribution(weights: np.ndarray, cov_annual: np.ndarray) -> np.ndarray:
     port_var = float(weights.T @ cov_annual @ weights)
     if port_var == 0:
@@ -173,7 +159,8 @@ def optimize_target_return(target_return: float, mean_returns_annual: np.ndarray
     return result
 
 
-def efficient_frontier(mean_returns_annual: np.ndarray, cov_annual: np.ndarray, n_points: int = 40) -> pd.DataFrame:
+@st.cache_data(ttl=3600, show_spinner=False)
+def efficient_frontier(mean_returns_annual: np.ndarray, cov_annual: np.ndarray, n_points: int = 25) -> pd.DataFrame:
     ret_min = float(np.min(mean_returns_annual))
     ret_max = float(np.max(mean_returns_annual))
     targets = np.linspace(ret_min, ret_max, n_points)
@@ -193,8 +180,8 @@ def efficient_frontier(mean_returns_annual: np.ndarray, cov_annual: np.ndarray, 
 def build_portfolio_metrics(weights: np.ndarray, asset_returns: pd.DataFrame, rf_annual: float) -> dict:
     mean_returns_annual = (asset_returns.mean() * TRADING_DAYS).values
     cov_annual = (asset_returns.cov() * TRADING_DAYS).values
-
     port_daily = asset_returns @ weights
+
     return {
         "Annualized Return": portfolio_return(weights, mean_returns_annual),
         "Annualized Volatility": portfolio_vol(weights, cov_annual),
@@ -232,33 +219,115 @@ def make_bar_chart(series: pd.Series, title: str, y_title: str):
     return fig
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def compute_sensitivity(asset_returns: pd.DataFrame, asset_cols: list[str], rf_annual: float):
+    sens_rows = []
+    weight_rows = []
+
+    total_obs = len(asset_returns)
+    available_options = []
+
+    if total_obs >= TRADING_DAYS * 1:
+        available_options.append("1 Year")
+    if total_obs >= TRADING_DAYS * 3:
+        available_options.append("3 Years")
+    if total_obs >= TRADING_DAYS * 5:
+        available_options.append("5 Years")
+    available_options.append("Full Sample")
+
+    for option in available_options:
+        if option == "1 Year":
+            sub = asset_returns.tail(TRADING_DAYS * 1)
+        elif option == "3 Years":
+            sub = asset_returns.tail(TRADING_DAYS * 3)
+        elif option == "5 Years":
+            sub = asset_returns.tail(TRADING_DAYS * 5)
+        else:
+            sub = asset_returns.copy()
+
+        sub_mean = sub.mean().values * TRADING_DAYS
+        sub_cov = sub.cov().values * TRADING_DAYS
+
+        sub_gmv = optimize_gmv(sub_cov)
+        sub_tan = optimize_tangency(sub_mean, sub_cov, rf_annual)
+
+        if sub_gmv.success:
+            gmv_w = sub_gmv.x
+            sens_rows.append({
+                "Window": option,
+                "Portfolio": "GMV",
+                "Annualized Return": portfolio_return(gmv_w, sub_mean),
+                "Annualized Volatility": portfolio_vol(gmv_w, sub_cov),
+                "Sharpe Ratio": np.nan,
+                "Weights": ", ".join([f"{asset_cols[i]}={gmv_w[i]:.2%}" for i in range(len(asset_cols))]),
+            })
+            for i, ticker in enumerate(asset_cols):
+                weight_rows.append({
+                    "Window": option,
+                    "Portfolio": "GMV",
+                    "Ticker": ticker,
+                    "Weight": gmv_w[i],
+                })
+
+        if sub_tan.success:
+            tan_w = sub_tan.x
+            sens_rows.append({
+                "Window": option,
+                "Portfolio": "Tangency",
+                "Annualized Return": portfolio_return(tan_w, sub_mean),
+                "Annualized Volatility": portfolio_vol(tan_w, sub_cov),
+                "Sharpe Ratio": portfolio_sharpe(tan_w, sub_mean, sub_cov, rf_annual),
+                "Weights": ", ".join([f"{asset_cols[i]}={tan_w[i]:.2%}" for i in range(len(asset_cols))]),
+            })
+            for i, ticker in enumerate(asset_cols):
+                weight_rows.append({
+                    "Window": option,
+                    "Portfolio": "Tangency",
+                    "Ticker": ticker,
+                    "Weight": tan_w[i],
+                })
+
+    sensitivity_df = pd.DataFrame(sens_rows)
+    weights_long = pd.DataFrame(weight_rows)
+    return sensitivity_df, weights_long
+
+
 # -------------------------------------------------------
-# Sidebar
+# Sidebar form
 # -------------------------------------------------------
 st.sidebar.header("Inputs")
 
-tickers_input = st.sidebar.text_input(
-    "Enter 3–10 stock tickers (comma separated)",
-    value="AAPL,MSFT,GOOGL,NVDA"
-)
+default_start = date.today() - timedelta(days=365 * 5)
+default_end = date.today() - timedelta(days=1)
+
+with st.sidebar.form("input_form"):
+    tickers_input = st.text_input(
+        "Enter 3–10 stock tickers (comma separated)",
+        value="AAPL,MSFT,GOOGL,NVDA"
+    )
+
+    start_date = st.date_input("Start Date", value=default_start, min_value=date(1970, 1, 1))
+    end_date = st.date_input("End Date", value=default_end, min_value=date(1970, 1, 1))
+
+    rf_annual = st.number_input(
+        "Annual Risk-Free Rate (%)",
+        min_value=0.0,
+        max_value=20.0,
+        value=2.0,
+        step=0.1
+    ) / 100
+
+    rolling_vol_window = st.selectbox("Rolling Volatility Window", [30, 60, 90, 120], index=1)
+    rolling_corr_window = st.selectbox("Rolling Correlation Window", [30, 60, 90, 120], index=1)
+
+    submitted = st.form_submit_button("Update Analysis")
+
+if not submitted:
+    st.info("Set your inputs in the sidebar, then click 'Update Analysis'.")
+    st.stop()
 
 user_tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-user_tickers = list(dict.fromkeys(user_tickers))  # remove duplicates, preserve order
-
-default_start = date.today() - timedelta(days=365 * 5)
-start_date = st.sidebar.date_input("Start Date", value=default_start, min_value=date(1970, 1, 1))
-end_date = st.sidebar.date_input("End Date", value=date.today(), min_value=date(1970, 1, 1))
-
-rf_annual = st.sidebar.number_input(
-    "Annual Risk-Free Rate (%)",
-    min_value=0.0,
-    max_value=20.0,
-    value=2.0,
-    step=0.1
-) / 100
-
-rolling_vol_window = st.sidebar.selectbox("Rolling Volatility Window", [30, 60, 90, 120], index=1)
-rolling_corr_window = st.sidebar.selectbox("Rolling Correlation Window", [30, 60, 90, 120], index=1)
+user_tickers = list(dict.fromkeys(user_tickers))
 
 # -------------------------------------------------------
 # Validation
@@ -281,64 +350,150 @@ if (end_date - start_date).days < 730:
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(tickers, start, end):
     try:
-        raw = yf.download(
-            tickers + [BENCHMARK],
+        fetch_end = pd.to_datetime(end) + pd.Timedelta(days=1)
+
+        raw_assets = yf.download(
+            tickers,
             start=start,
-            end=end,
+            end=fetch_end,
             auto_adjust=False,
             group_by="column",
             progress=False,
             threads=False,
         )
 
-        if raw.empty:
-            return None, ["No data returned from Yahoo Finance."], [], []
+        if raw_assets is None or raw_assets.empty:
+            return None, ["No data returned for the selected stock tickers."], [], []
 
-        if not isinstance(raw.columns, pd.MultiIndex):
-            return None, ["Unexpected data format returned by yfinance."], [], []
+        if not isinstance(raw_assets.columns, pd.MultiIndex):
+            return None, [f"Unexpected stock data format: {list(raw_assets.columns)}"], [], []
 
-        level0 = raw.columns.get_level_values(0)
-        if "Adj Close" in level0:
-            prices = raw["Adj Close"].copy()
-        elif "Close" in level0:
-            prices = raw["Close"].copy()
+        asset_level0 = raw_assets.columns.get_level_values(0)
+        if "Adj Close" in asset_level0:
+            asset_prices = raw_assets["Adj Close"].copy()
+        elif "Close" in asset_level0:
+            asset_prices = raw_assets["Close"].copy()
         else:
-            return None, [f"Expected 'Adj Close' or 'Close' columns. Found: {sorted(set(level0))}"], [], []
+            return None, [f"Expected 'Adj Close' or 'Close' for stocks. Found: {sorted(set(asset_level0))}"], [], []
 
-        expected = tickers + [BENCHMARK]
-        missing_cols = [c for c in expected if c not in prices.columns]
-        invalid_tickers = missing_cols.copy()
+        if isinstance(asset_prices, pd.Series):
+            asset_prices = asset_prices.to_frame()
 
-        # Keep only returned columns
-        existing_cols = [c for c in expected if c in prices.columns]
-        prices = prices[existing_cols].sort_index()
+        expected_assets = tickers.copy()
+        existing_assets = [c for c in expected_assets if c in asset_prices.columns]
+        missing_assets = [c for c in expected_assets if c not in asset_prices.columns]
 
-        # Drop entirely empty columns
-        all_nan_cols = prices.columns[prices.isna().all()].tolist()
-        invalid_tickers.extend([c for c in all_nan_cols if c != BENCHMARK])
-        prices = prices.drop(columns=all_nan_cols, errors="ignore")
+        asset_prices = asset_prices[existing_assets].sort_index()
 
-        if BENCHMARK not in prices.columns:
-            return None, ["Benchmark (^GSPC) failed to download."], [], list(dict.fromkeys(invalid_tickers))
+        all_empty_assets = asset_prices.columns[asset_prices.isna().all()].tolist()
+        asset_prices = asset_prices.drop(columns=all_empty_assets, errors="ignore")
 
-        # Missing-value screening for user tickers only
-        asset_cols = [c for c in prices.columns if c != BENCHMARK]
-        missing_fraction = prices[asset_cols].isna().mean()
-        dropped_for_missing = missing_fraction[missing_fraction > 0.05].index.tolist()
+        # Retry missing tickers individually
+        retried_frames = []
+        for tkr in missing_assets:
+            try:
+                single = yf.download(
+                    tkr,
+                    start=start,
+                    end=fetch_end,
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
 
-        keep_assets = [c for c in asset_cols if c not in dropped_for_missing]
-        keep_cols = keep_assets + [BENCHMARK]
-        prices = prices[keep_cols]
+                if single is not None and not single.empty:
+                    if isinstance(single.columns, pd.MultiIndex):
+                        lvl0 = single.columns.get_level_values(0)
+                        if "Adj Close" in lvl0:
+                            s = single["Adj Close"]
+                        elif "Close" in lvl0:
+                            s = single["Close"]
+                        else:
+                            continue
+                    else:
+                        if "Adj Close" in single.columns:
+                            s = single["Adj Close"]
+                        elif "Close" in single.columns:
+                            s = single["Close"]
+                        else:
+                            continue
 
-        # Align on common dates across remaining columns
+                    if isinstance(s, pd.DataFrame):
+                        s = s.iloc[:, 0]
+
+                    retried_frames.append(s.rename(tkr))
+            except Exception:
+                pass
+
+        if retried_frames:
+            retry_df = pd.concat(retried_frames, axis=1)
+            asset_prices = pd.concat([asset_prices, retry_df], axis=1)
+            asset_prices = asset_prices.loc[:, ~asset_prices.columns.duplicated()]
+            asset_prices = asset_prices.sort_index()
+
+        all_empty_assets = asset_prices.columns[asset_prices.isna().all()].tolist()
+        asset_prices = asset_prices.drop(columns=all_empty_assets, errors="ignore")
+
+        invalid_tickers = [c for c in expected_assets if c not in asset_prices.columns]
+        invalid_tickers = list(dict.fromkeys(invalid_tickers + all_empty_assets))
+
+        if not asset_prices.empty:
+            missing_fraction = asset_prices.isna().mean()
+            dropped_for_missing = missing_fraction[missing_fraction > 0.05].index.tolist()
+            keep_assets = [c for c in asset_prices.columns if c not in dropped_for_missing]
+            asset_prices = asset_prices[keep_assets]
+        else:
+            dropped_for_missing = []
+
+        if asset_prices.shape[1] < 3:
+            return None, ["Fewer than 3 valid stock tickers remain after cleaning."], dropped_for_missing, invalid_tickers
+
+        raw_benchmark = yf.download(
+            BENCHMARK,
+            start=start,
+            end=fetch_end,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+
+        if raw_benchmark is None or raw_benchmark.empty:
+            return None, [f"Benchmark ({BENCHMARK}) failed to download from Yahoo Finance."], dropped_for_missing, invalid_tickers
+
+        if isinstance(raw_benchmark.columns, pd.MultiIndex):
+            bench_level0 = raw_benchmark.columns.get_level_values(0)
+            if "Adj Close" in bench_level0:
+                benchmark_prices = raw_benchmark["Adj Close"].copy()
+            elif "Close" in bench_level0:
+                benchmark_prices = raw_benchmark["Close"].copy()
+            else:
+                return None, [f"Expected 'Adj Close' or 'Close' for benchmark. Found: {sorted(set(bench_level0))}"], dropped_for_missing, invalid_tickers
+        else:
+            if "Adj Close" in raw_benchmark.columns:
+                benchmark_prices = raw_benchmark["Adj Close"].copy()
+            elif "Close" in raw_benchmark.columns:
+                benchmark_prices = raw_benchmark["Close"].copy()
+            else:
+                return None, [f"Expected 'Adj Close' or 'Close' for benchmark. Found: {list(raw_benchmark.columns)}"], dropped_for_missing, invalid_tickers
+
+        if isinstance(benchmark_prices, pd.DataFrame):
+            benchmark_prices = benchmark_prices.iloc[:, 0]
+
+        benchmark_prices = benchmark_prices.rename(BENCHMARK).to_frame()
+
+        prices = pd.concat([asset_prices, benchmark_prices], axis=1)
         prices = prices.dropna(how="any")
 
-        return prices, [], dropped_for_missing, list(dict.fromkeys(invalid_tickers))
+        if prices.empty:
+            return None, ["After aligning stock and benchmark dates, no overlapping observations remained."], dropped_for_missing, invalid_tickers
+
+        return prices, [], dropped_for_missing, invalid_tickers
 
     except Exception as e:
         return None, [str(e)], [], []
 
-with st.spinner("Downloading price data..."):
+
+with st.spinner("Downloading and analyzing data..."):
     prices, download_errors, dropped_for_missing, invalid_tickers = load_data(user_tickers, start_date, end_date)
 
 if download_errors:
@@ -402,7 +557,8 @@ tan_metrics = build_portfolio_metrics(tan_weights, asset_returns, rf_annual)
 gmv_prc = pd.Series(risk_contribution(gmv_weights, cov_annual), index=asset_cols)
 tan_prc = pd.Series(risk_contribution(tan_weights, cov_annual), index=asset_cols)
 
-frontier_df = efficient_frontier(mean_returns_annual, cov_annual, n_points=40)
+frontier_df = efficient_frontier(mean_returns_annual, cov_annual, n_points=25)
+sensitivity_df, weights_long = compute_sensitivity(asset_returns, asset_cols, rf_annual)
 
 # -------------------------------------------------------
 # Tabs
@@ -416,9 +572,6 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Estimation Window Sensitivity",
 ])
 
-# -------------------------------------------------------
-# Tab 1: Inputs & Data
-# -------------------------------------------------------
 with tab1:
     st.subheader("Data Summary")
 
@@ -442,6 +595,16 @@ with tab1:
     })
     st.dataframe(info_df, use_container_width=True, hide_index=True)
 
+    with st.expander("Debug download info"):
+        st.write("Requested stock tickers:", user_tickers)
+        st.write("Benchmark:", BENCHMARK)
+        st.write("Start date:", start_date)
+        st.write("End date:", end_date)
+        st.write("Prices shape:", prices.shape)
+        st.write("Invalid stock tickers:", invalid_tickers)
+        st.write("Dropped for missing:", dropped_for_missing)
+        st.write("Download errors:", download_errors)
+
     st.subheader("Adjusted Close Prices")
     st.plotly_chart(
         make_line_chart(prices, "Adjusted Close Prices", "Price"),
@@ -451,9 +614,6 @@ with tab1:
     with st.expander("Preview cleaned price data"):
         st.dataframe(prices.tail(20), use_container_width=True)
 
-# -------------------------------------------------------
-# Tab 2: Returns & Exploratory Analysis
-# -------------------------------------------------------
 with tab2:
     st.subheader("Summary Statistics")
     stats_df = summary_stats(all_returns)
@@ -479,11 +639,7 @@ with tab2:
         st.info("Select at least one series to display the cumulative wealth chart.")
     else:
         st.plotly_chart(
-            make_line_chart(
-                wealth_df,
-                "Growth of $10,000",
-                "Portfolio Value ($)"
-            ),
+            make_line_chart(wealth_df, "Growth of $10,000", "Portfolio Value ($)"),
             use_container_width=True
         )
 
@@ -553,9 +709,6 @@ with tab2:
         )
         st.plotly_chart(qq_fig, use_container_width=True)
 
-# -------------------------------------------------------
-# Tab 3: Risk Analysis
-# -------------------------------------------------------
 with tab3:
     st.subheader("Rolling Annualized Volatility")
     rolling_vol_df = asset_returns.rolling(rolling_vol_window).std() * np.sqrt(TRADING_DAYS)
@@ -596,9 +749,6 @@ with tab3:
         "Sortino Ratio": "{:.3f}",
     }), use_container_width=True)
 
-# -------------------------------------------------------
-# Tab 4: Correlation & Covariance
-# -------------------------------------------------------
 with tab4:
     st.subheader("Correlation Heatmap")
     corr_df = asset_returns.corr()
@@ -640,9 +790,6 @@ with tab4:
         cov_df = asset_returns.cov()
         st.dataframe(cov_df, use_container_width=True)
 
-# -------------------------------------------------------
-# Tab 5: Portfolio Construction & Optimization
-# -------------------------------------------------------
 with tab5:
     st.subheader("Equal-Weight Portfolio")
     eq_display = pd.DataFrame({
@@ -807,7 +954,6 @@ with tab5:
             name="Efficient Frontier"
         ))
 
-    # Individual assets
     asset_points_x = asset_returns.std().values * np.sqrt(TRADING_DAYS)
     asset_points_y = asset_returns.mean().values * TRADING_DAYS
     frontier_fig.add_trace(go.Scatter(
@@ -819,7 +965,6 @@ with tab5:
         name="Individual Stocks"
     ))
 
-    # Benchmark
     bm_x = annualized_vol(benchmark_returns)
     bm_y = annualized_return(benchmark_returns)
     frontier_fig.add_trace(go.Scatter(
@@ -831,7 +976,6 @@ with tab5:
         marker=dict(size=10)
     ))
 
-    # Portfolio points
     frontier_fig.add_trace(go.Scatter(
         x=[eq_metrics["Annualized Volatility"]],
         y=[eq_metrics["Annualized Return"]],
@@ -872,10 +1016,13 @@ with tab5:
         marker=dict(size=11)
     ))
 
-    # CAL
     tan_vol = tan_metrics["Annualized Volatility"]
     tan_ret = tan_metrics["Annualized Return"]
-    cal_x = np.linspace(0, max(frontier_df["Volatility"].max() if not frontier_df.empty else tan_vol, tan_vol) * 1.15, 50)
+    max_x = tan_vol * 1.15
+    if not frontier_df.empty:
+        max_x = max(max_x, frontier_df["Volatility"].max() * 1.15)
+
+    cal_x = np.linspace(0, max_x, 50)
     cal_slope = (tan_ret - rf_annual) / tan_vol if tan_vol != 0 else 0
     cal_y = rf_annual + cal_slope * cal_x
 
@@ -960,9 +1107,6 @@ with tab5:
         "Max Drawdown": "{:.2%}",
     }), use_container_width=True)
 
-# -------------------------------------------------------
-# Tab 6: Estimation Window Sensitivity
-# -------------------------------------------------------
 with tab6:
     st.subheader("Estimation Window Sensitivity")
     st.caption(
@@ -970,73 +1114,6 @@ with tab6:
         "This section shows how GMV and tangency allocations can change when the lookback window changes."
     )
 
-    available_options = []
-    total_obs = len(asset_returns)
-
-    if total_obs >= TRADING_DAYS * 1:
-        available_options.append("1 Year")
-    if total_obs >= TRADING_DAYS * 3:
-        available_options.append("3 Years")
-    if total_obs >= TRADING_DAYS * 5:
-        available_options.append("5 Years")
-    available_options.append("Full Sample")
-
-    sens_rows = []
-    weight_rows = []
-
-    for option in available_options:
-        if option == "1 Year":
-            sub = asset_returns.tail(TRADING_DAYS * 1)
-        elif option == "3 Years":
-            sub = asset_returns.tail(TRADING_DAYS * 3)
-        elif option == "5 Years":
-            sub = asset_returns.tail(TRADING_DAYS * 5)
-        else:
-            sub = asset_returns.copy()
-
-        sub_mean = sub.mean().values * TRADING_DAYS
-        sub_cov = sub.cov().values * TRADING_DAYS
-
-        sub_gmv = optimize_gmv(sub_cov)
-        sub_tan = optimize_tangency(sub_mean, sub_cov, rf_annual)
-
-        if sub_gmv.success:
-            gmv_w = sub_gmv.x
-            sens_rows.append({
-                "Window": option,
-                "Portfolio": "GMV",
-                "Annualized Return": portfolio_return(gmv_w, sub_mean),
-                "Annualized Volatility": portfolio_vol(gmv_w, sub_cov),
-                "Sharpe Ratio": np.nan,
-                "Weights": ", ".join([f"{asset_cols[i]}={gmv_w[i]:.2%}" for i in range(len(asset_cols))]),
-            })
-            for i, ticker in enumerate(asset_cols):
-                weight_rows.append({
-                    "Window": option,
-                    "Portfolio": "GMV",
-                    "Ticker": ticker,
-                    "Weight": gmv_w[i],
-                })
-
-        if sub_tan.success:
-            tan_w = sub_tan.x
-            sens_rows.append({
-                "Window": option,
-                "Portfolio": "Tangency",
-                "Annualized Return": portfolio_return(tan_w, sub_mean),
-                "Annualized Volatility": portfolio_vol(tan_w, sub_cov),
-                "Sharpe Ratio": portfolio_sharpe(tan_w, sub_mean, sub_cov, rf_annual),
-                "Weights": ", ".join([f"{asset_cols[i]}={tan_w[i]:.2%}" for i in range(len(asset_cols))]),
-            })
-            for i, ticker in enumerate(asset_cols):
-                weight_rows.append({
-                    "Window": option,
-                    "Portfolio": "Tangency",
-                    "Ticker": ticker,
-                    "Weight": tan_w[i],
-                })
-
-    sensitivity_df = pd.DataFrame(sens_rows)
     st.dataframe(
         sensitivity_df.style.format({
             "Annualized Return": "{:.2%}",
@@ -1046,9 +1123,7 @@ with tab6:
         use_container_width=True
     )
 
-    if weight_rows:
-        weights_long = pd.DataFrame(weight_rows)
-
+    if not weights_long.empty:
         chosen_portfolio = st.radio(
             "Choose portfolio weights to compare across windows",
             ["GMV", "Tangency"],
@@ -1073,17 +1148,14 @@ with tab6:
         )
         st.plotly_chart(sens_fig, use_container_width=True)
 
-# -------------------------------------------------------
-# Methodology / About
-# -------------------------------------------------------
 with st.expander("About / Methodology"):
     st.markdown(
         """
 **Analytical Methods**
-- Uses daily **simple returns**, not log returns.
+- Uses daily simple returns, not log returns.
 - Annualized return = mean daily return × 252.
 - Annualized volatility = daily standard deviation × √252.
-- Sharpe and Sortino ratios use the user-specified **annualized risk-free rate**.
+- Sharpe and Sortino ratios use the user-specified annualized risk-free rate.
 - Downside deviation for Sortino uses only returns below the daily risk-free threshold.
 - Cumulative wealth uses `(1 + r).cumprod()`.
 
