@@ -618,17 +618,7 @@ with tab1:
     })
     st.dataframe(info_df, use_container_width=True, hide_index=True)
 
-    with st.expander("Debug download info"):
-        st.write("Requested stock tickers:", user_tickers)
-        st.write("Benchmark:", BENCHMARK)
-        st.write("Start date:", start_date)
-        st.write("End date:", end_date)
-        st.write("Prices shape:", prices.shape)
-        st.write("Final asset columns after cleaning:", asset_cols)
-        st.write("Invalid stock tickers:", invalid_tickers)
-        st.write("Dropped for missing:", dropped_for_missing)
-        st.write("Download errors:", download_errors)
-
+  
     st.subheader("Adjusted Close Prices")
     st.plotly_chart(
         make_line_chart(prices, "Adjusted Close Prices", "Price"),
