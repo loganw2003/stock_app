@@ -7,117 +7,243 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from datetime import date, timedelta
+from scipy.optimize import minimize
 import math
 
-# -- Page configuration ----------------------------------
-# st.set_page_config must be the FIRST Streamlit command in the script.
-# If you add any other st.* calls above this line, you'll get an error.
-st.set_page_config(page_title="Stock Analyzer", layout="wide")
-st.title("Stock Analysis Dashboard")
+st.set_page_config(page_title="Portfolio Analytics", layout="wide")
+st.title("📊 Interactive Portfolio Analytics")
 
-# -- Sidebar: user inputs --------------------------------
-st.sidebar.header("Settings")
+# ---------------- SIDEBAR ----------------
+st.sidebar.header("User Inputs")
 
-ticker = st.sidebar.text_input("Stock Ticker", value="AAPL").upper().strip()
-
-# Default date range: one year back from today
-default_start = date.today() - timedelta(days=365)
-start_date = st.sidebar.date_input("Start Date", value=default_start, min_value=date(1970,1,1))
-end_date = st.sidebar.date_input("End Date", value=date.today(), min_value=date(1970,1,1))
-
-# Validate that the date range makes sense
-if start_date >= end_date:
-    st.sidebar.error("Start date must be before end date.")
-    st.stop()
-
-# Let the user pick a moving-average window
-ma_window = st.sidebar.slider(
-    "Moving Average Window (days)", min_value=5, max_value=200, value=50, step=5
+tickers_input = st.sidebar.text_input(
+    "Enter 3–10 tickers (comma separated)",
+    value="AAPL,MSFT,GOOGL"
 )
 
-# -- Data download ----------------------------------------
-# We wrap the download in st.cache_data so repeated runs with
-# the same inputs don't re-download every time. The ttl (time-to-live)
-# ensures the cache expires after one hour so data stays fresh.
-@st.cache_data(show_spinner="Fetching data...", ttl=3600)
-def load_data(ticker: str, start: date, end: date) -> pd.DataFrame:
-    """Download daily data from Yahoo Finance for a given date range."""
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    return df
+tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 
-# -- Main logic -------------------------------------------
-if ticker:
-    try:
-        df = load_data(ticker, start_date, end_date)
-    except Exception as e:
-        st.error(f"Failed to download data: {e}")
-        st.stop()
+rf_rate = st.sidebar.number_input("Risk-Free Rate (%)", value=2.0) / 100
+rf_daily = rf_rate / 252
 
-    if df.empty:
-        st.error(
-            f"No data found for **{ticker}**. "
-            "Check the ticker symbol and try again."
-        )
-        st.stop()
+start_date = st.sidebar.date_input(
+    "Start Date",
+    value=date.today() - timedelta(days=365*5)
+)
 
-    # Flatten multi-index columns
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+end_date = st.sidebar.date_input("End Date", value=date.today())
 
-    # -- Compute derived columns --------------------------
-    df["Daily Return"] = df["Close"].pct_change()
-    df[f"{ma_window}-Day MA"] = df["Close"].rolling(window=ma_window).mean()
+# ---------------- VALIDATION ----------------
+if len(tickers) < 3 or len(tickers) > 10:
+    st.error("Please enter between 3 and 10 tickers.")
+    st.stop()
 
-    if ma_window > len(df):
-        st.warning(
-            f"{ma_window}-day MA is longer than dataset ({len(df)} days)."
-        )
+if (end_date - start_date).days < 730:
+    st.error("Minimum 2-year range required.")
+    st.stop()
 
-    # -- Key metrics --------------------------------------
-    latest_close = float(df["Close"].iloc[-1])
-    total_return = float((df["Close"].iloc[-1] / df["Close"].iloc[0]) - 1)
-    volatility = float(df["Daily Return"].std())
-    ann_volatility = volatility * math.sqrt(252)
-    max_close = float(df["Close"].max())
-    min_close = float(df["Close"].min())
+# ---------------- DATA ----------------
+@st.cache_data(ttl=3600)
+def load_data(tickers, start, end):
+    data = yf.download(tickers + ["^GSPC"], start=start, end=end)["Adj Close"]
+    return data
 
-    st.subheader(f"{ticker} — Key Metrics")
+prices = load_data(tickers, start_date, end_date)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Latest Close", f"${latest_close:,.2f}")
-    col2.metric("Return", f"{total_return:.2%}")
-    col3.metric("Annual Volatility", f"{ann_volatility:.2%}")
+returns = prices.pct_change().dropna()
 
-    col4, col5, _ = st.columns(3)
-    col4.metric("High", f"${max_close:,.2f}")
-    col5.metric("Low", f"${min_close:,.2f}")
+# ---------------- FUNCTIONS ----------------
+def annualized_return(r):
+    return r.mean() * 252
 
-    st.divider()
+def annualized_vol(r):
+    return r.std() * np.sqrt(252)
 
-    # -- Chart --------------------------------------------
-    st.subheader("Price & Moving Average")
+def sharpe_ratio(r):
+    return (annualized_return(r) - rf_rate) / annualized_vol(r)
+
+def sortino_ratio(r):
+    downside = r[r < rf_daily]
+    return (annualized_return(r) - rf_rate) / (downside.std() * np.sqrt(252))
+
+def portfolio_stats(w, mean, cov):
+    ret = np.dot(w, mean)
+    vol = np.sqrt(w.T @ cov @ w)
+    sharpe = (ret - rf_rate) / vol
+    return ret, vol, sharpe
+
+def max_drawdown(series):
+    cum = (1 + series).cumprod()
+    peak = cum.cummax()
+    dd = (cum - peak) / peak
+    return dd.min()
+
+# ---------------- TABS ----------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📈 Returns",
+    "⚠️ Risk",
+    "🔗 Correlation",
+    "📊 Portfolio",
+    "🔍 Sensitivity"
+])
+
+# =======================
+# RETURNS
+# =======================
+with tab1:
+    st.subheader("Summary Statistics")
+
+    stats = pd.DataFrame({
+        "Return": returns.apply(annualized_return),
+        "Volatility": returns.apply(annualized_vol),
+        "Skew": returns.skew(),
+        "Kurtosis": returns.kurtosis(),
+        "Min": returns.min(),
+        "Max": returns.max()
+    })
+
+    st.dataframe(stats)
+
+    st.subheader("Cumulative Wealth")
+    wealth = (1 + returns).cumprod() * 10000
+    st.line_chart(wealth)
+
+# =======================
+# RISK
+# =======================
+with tab2:
+    window = st.slider("Rolling Vol Window", 30, 120, 60)
+
+    rolling_vol = returns.rolling(window).std() * np.sqrt(252)
+    st.line_chart(rolling_vol)
+
+    stock = st.selectbox("Drawdown Stock", returns.columns)
+    dd = (1 + returns[stock]).cumprod()
+    dd = (dd - dd.cummax()) / dd.cummax()
+
+    st.line_chart(dd)
+    st.metric("Max Drawdown", f"{dd.min():.2%}")
+
+    st.subheader("Sharpe & Sortino")
+    ratios = pd.DataFrame({
+        "Sharpe": returns.apply(sharpe_ratio),
+        "Sortino": returns.apply(sortino_ratio)
+    })
+    st.dataframe(ratios)
+
+# =======================
+# CORRELATION
+# =======================
+with tab3:
+    st.dataframe(returns.corr())
+
+    s1 = st.selectbox("Stock 1", returns.columns)
+    s2 = st.selectbox("Stock 2", returns.columns)
+
+    rolling_corr = returns[s1].rolling(60).corr(returns[s2])
+    st.line_chart(rolling_corr)
+
+# =======================
+# PORTFOLIO
+# =======================
+with tab4:
+    mean = returns.mean() * 252
+    cov = returns.cov() * 252
+    n = len(mean)
+
+    bounds = tuple((0,1) for _ in range(n))
+    constraints = {'type': 'eq', 'fun': lambda w: np.sum(w)-1}
+    init = np.ones(n)/n
+
+    # GMV
+    def gmv(w):
+        return np.sqrt(w.T @ cov @ w)
+
+    gmv_res = minimize(gmv, init, bounds=bounds, constraints=constraints)
+    w_gmv = gmv_res.x
+
+    # Tangency
+    def neg_sharpe(w):
+        return -portfolio_stats(w, mean, cov)[2]
+
+    tan_res = minimize(neg_sharpe, init, bounds=bounds, constraints=constraints)
+    w_tan = tan_res.x
+
+    # Custom portfolio
+    st.subheader("Custom Portfolio")
+    sliders = np.array([
+        st.slider(f"{t}", 0.0, 1.0, 1.0/n)
+        for t in tickers
+    ])
+    w_custom = sliders / sliders.sum()
+
+    st.write("Normalized Weights:", pd.Series(w_custom, index=tickers))
+
+    # Risk contribution
+    def risk_contribution(w):
+        port_var = w.T @ cov @ w
+        return (w * (cov @ w)) / port_var
+
+    prc = risk_contribution(w_tan)
+
+    st.subheader("Risk Contribution (Tangency)")
+    st.bar_chart(pd.Series(prc, index=tickers))
+
+    # Efficient Frontier
+    target_returns = np.linspace(mean.min(), mean.max(), 50)
+    vols = []
+
+    for tr in target_returns:
+        cons = [
+            {'type':'eq','fun':lambda w: np.sum(w)-1},
+            {'type':'eq','fun':lambda w: np.dot(w, mean)-tr}
+        ]
+        res = minimize(gmv, init, bounds=bounds, constraints=cons)
+        vols.append(res.fun)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["Close"],
-        mode="lines", name="Close"
-    ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df[f"{ma_window}-Day MA"],
-        mode="lines", name=f"{ma_window}-Day MA",
-        line=dict(dash="dash")
-    ))
+    fig.add_trace(go.Scatter(x=vols, y=target_returns, name="Efficient Frontier"))
+    st.plotly_chart(fig)
 
-    fig.update_layout(
-        yaxis_title="Price (USD)",
-        xaxis_title="Date",
-        template="plotly_white",
-        height=450
-    )
+# =======================
+# SENSITIVITY
+# =======================
+with tab5:
+    st.subheader("Estimation Window Sensitivity")
 
-    st.plotly_chart(fig, use_container_width=True)
+    options = ["1Y", "3Y", "5Y", "Full"]
+    results = []
 
-else:
-    st.info("Enter a stock ticker in the sidebar to get started.")
+    for opt in options:
+        if opt == "Full":
+            sub = returns
+        else:
+            days = int(opt[0]) * 252
+            if len(returns) < days:
+                continue
+            sub = returns.tail(days)
+
+        mean_s = sub.mean() * 252
+        cov_s = sub.cov() * 252
+
+        res = minimize(neg_sharpe, init, bounds=bounds, constraints=constraints)
+        w = res.x
+        r, v, s = portfolio_stats(w, mean_s, cov_s)
+
+        results.append([opt, r, v, s])
+
+    df_sens = pd.DataFrame(results, columns=["Window","Return","Vol","Sharpe"])
+    st.dataframe(df_sens)
+
+# ---------------- ABOUT ----------------
+with st.expander("About"):
+    st.write("""
+    - Simple returns used
+    - Annualization uses 252 trading days
+    - Risk-free rate converted to daily
+    - No short selling
+    - Data: Yahoo Finance
+    """)
