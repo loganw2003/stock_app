@@ -9,262 +9,1099 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from datetime import date, timedelta
 from scipy.optimize import minimize
+from scipy import stats
 
-st.set_page_config(page_title="Portfolio Analytics", layout="wide")
-st.title("📊 Interactive Portfolio Analytics")
+# -------------------------------------------------------
+# Page config
+# -------------------------------------------------------
+st.set_page_config(page_title="Interactive Portfolio Analytics", layout="wide")
+st.title("📊 Interactive Portfolio Analytics Application")
 
-# ---------------- SIDEBAR ----------------
-st.sidebar.header("User Inputs")
+TRADING_DAYS = 252
+BENCHMARK = "^GSPC"
+
+# -------------------------------------------------------
+# Helpers
+# -------------------------------------------------------
+def format_pct(x):
+    return f"{x:.2%}" if pd.notna(x) else "N/A"
+
+
+def annualized_return(series: pd.Series) -> float:
+    return series.mean() * TRADING_DAYS
+
+
+def annualized_vol(series: pd.Series) -> float:
+    return series.std() * np.sqrt(TRADING_DAYS)
+
+
+def downside_deviation(series: pd.Series, rf_annual: float) -> float:
+    rf_daily = rf_annual / TRADING_DAYS
+    downside = series[series < rf_daily] - rf_daily
+    if len(downside) == 0:
+        return np.nan
+    return np.sqrt((downside.pow(2).mean()) * TRADING_DAYS)
+
+
+def sharpe_ratio(series: pd.Series, rf_annual: float) -> float:
+    vol = annualized_vol(series)
+    if vol == 0 or pd.isna(vol):
+        return np.nan
+    return (annualized_return(series) - rf_annual) / vol
+
+
+def sortino_ratio(series: pd.Series, rf_annual: float) -> float:
+    dd = downside_deviation(series, rf_annual)
+    if dd == 0 or pd.isna(dd):
+        return np.nan
+    return (annualized_return(series) - rf_annual) / dd
+
+
+def max_drawdown_from_returns(series: pd.Series) -> float:
+    wealth = (1 + series).cumprod()
+    running_peak = wealth.cummax()
+    drawdown = wealth / running_peak - 1
+    return drawdown.min()
+
+
+def summary_stats(returns_df: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame({
+        "Annualized Mean Return": returns_df.mean() * TRADING_DAYS,
+        "Annualized Volatility": returns_df.std() * np.sqrt(TRADING_DAYS),
+        "Skewness": returns_df.skew(),
+        "Kurtosis": returns_df.kurtosis(),
+        "Min Daily Return": returns_df.min(),
+        "Max Daily Return": returns_df.max(),
+    })
+
+
+def risk_adjusted_table(returns_df: pd.DataFrame, rf_annual: float) -> pd.DataFrame:
+    return pd.DataFrame({
+        "Sharpe Ratio": returns_df.apply(lambda s: sharpe_ratio(s, rf_annual)),
+        "Sortino Ratio": returns_df.apply(lambda s: sortino_ratio(s, rf_annual)),
+    })
+
+
+def portfolio_return(weights: np.ndarray, mean_returns_annual: np.ndarray) -> float:
+    return float(weights @ mean_returns_annual)
+
+
+def portfolio_vol(weights: np.ndarray, cov_annual: np.ndarray) -> float:
+    return float(np.sqrt(weights.T @ cov_annual @ weights))
+
+
+def portfolio_sharpe(weights: np.ndarray, mean_returns_annual: np.ndarray, cov_annual: np.ndarray, rf_annual: float) -> float:
+    vol = portfolio_vol(weights, cov_annual)
+    if vol == 0:
+        return np.nan
+    return (portfolio_return(weights, mean_returns_annual) - rf_annual) / vol
+
+
+def portfolio_sortino(portfolio_daily_returns: pd.Series, rf_annual: float) -> float:
+    return sortino_ratio(portfolio_daily_returns, rf_annual)
+
+
+def portfolio_max_drawdown(portfolio_daily_returns: pd.Series) -> float:
+    return max_drawdown_from_returns(portfolio_daily_returns)
+
+
+def risk_contribution(weights: np.ndarray, cov_annual: np.ndarray) -> np.ndarray:
+    port_var = float(weights.T @ cov_annual @ weights)
+    if port_var == 0:
+        return np.full_like(weights, np.nan)
+    return (weights * (cov_annual @ weights)) / port_var
+
+
+def optimize_gmv(cov_annual: np.ndarray):
+    n = cov_annual.shape[0]
+    x0 = np.ones(n) / n
+    bounds = [(0.0, 1.0)] * n
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+
+    result = minimize(
+        lambda w: portfolio_vol(w, cov_annual),
+        x0=x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+    )
+    return result
+
+
+def optimize_tangency(mean_returns_annual: np.ndarray, cov_annual: np.ndarray, rf_annual: float):
+    n = len(mean_returns_annual)
+    x0 = np.ones(n) / n
+    bounds = [(0.0, 1.0)] * n
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+
+    def negative_sharpe(w):
+        vol = portfolio_vol(w, cov_annual)
+        if vol == 0:
+            return 1e9
+        ret = portfolio_return(w, mean_returns_annual)
+        return -((ret - rf_annual) / vol)
+
+    result = minimize(
+        negative_sharpe,
+        x0=x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+    )
+    return result
+
+
+def optimize_target_return(target_return: float, mean_returns_annual: np.ndarray, cov_annual: np.ndarray):
+    n = len(mean_returns_annual)
+    x0 = np.ones(n) / n
+    bounds = [(0.0, 1.0)] * n
+    constraints = [
+        {"type": "eq", "fun": lambda w: np.sum(w) - 1},
+        {"type": "eq", "fun": lambda w: (w @ mean_returns_annual) - target_return},
+    ]
+
+    result = minimize(
+        lambda w: portfolio_vol(w, cov_annual),
+        x0=x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+    )
+    return result
+
+
+def efficient_frontier(mean_returns_annual: np.ndarray, cov_annual: np.ndarray, n_points: int = 40) -> pd.DataFrame:
+    ret_min = float(np.min(mean_returns_annual))
+    ret_max = float(np.max(mean_returns_annual))
+    targets = np.linspace(ret_min, ret_max, n_points)
+
+    rows = []
+    for target in targets:
+        res = optimize_target_return(target, mean_returns_annual, cov_annual)
+        if res.success:
+            rows.append({
+                "Target Return": target,
+                "Volatility": portfolio_vol(res.x, cov_annual),
+                "Weights": res.x,
+            })
+    return pd.DataFrame(rows)
+
+
+def build_portfolio_metrics(weights: np.ndarray, asset_returns: pd.DataFrame, rf_annual: float) -> dict:
+    mean_returns_annual = (asset_returns.mean() * TRADING_DAYS).values
+    cov_annual = (asset_returns.cov() * TRADING_DAYS).values
+
+    port_daily = asset_returns @ weights
+    return {
+        "Annualized Return": portfolio_return(weights, mean_returns_annual),
+        "Annualized Volatility": portfolio_vol(weights, cov_annual),
+        "Sharpe Ratio": sharpe_ratio(port_daily, rf_annual),
+        "Sortino Ratio": sortino_ratio(port_daily, rf_annual),
+        "Max Drawdown": max_drawdown_from_returns(port_daily),
+        "Daily Returns": port_daily,
+    }
+
+
+def make_line_chart(df: pd.DataFrame, title: str, y_title: str):
+    fig = go.Figure()
+    for col in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Date",
+        yaxis_title=y_title,
+        template="plotly_white",
+        height=500,
+    )
+    return fig
+
+
+def make_bar_chart(series: pd.Series, title: str, y_title: str):
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=series.index.tolist(), y=series.values))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Asset",
+        yaxis_title=y_title,
+        template="plotly_white",
+        height=450,
+    )
+    return fig
+
+
+# -------------------------------------------------------
+# Sidebar
+# -------------------------------------------------------
+st.sidebar.header("Inputs")
 
 tickers_input = st.sidebar.text_input(
-    "Enter 3–10 tickers (comma separated)",
-    value="AAPL,MSFT,GOOGL"
+    "Enter 3–10 stock tickers (comma separated)",
+    value="AAPL,MSFT,GOOGL,NVDA"
 )
 
-tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+user_tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+user_tickers = list(dict.fromkeys(user_tickers))  # remove duplicates, preserve order
 
-rf_rate = st.sidebar.number_input("Risk-Free Rate (%)", value=2.0) / 100
-rf_daily = rf_rate / 252
+default_start = date.today() - timedelta(days=365 * 5)
+start_date = st.sidebar.date_input("Start Date", value=default_start, min_value=date(1970, 1, 1))
+end_date = st.sidebar.date_input("End Date", value=date.today(), min_value=date(1970, 1, 1))
 
-start_date = st.sidebar.date_input(
-    "Start Date",
-    value=date.today() - timedelta(days=365*5)
-)
+rf_annual = st.sidebar.number_input(
+    "Annual Risk-Free Rate (%)",
+    min_value=0.0,
+    max_value=20.0,
+    value=2.0,
+    step=0.1
+) / 100
 
-end_date = st.sidebar.date_input("End Date", value=date.today())
+rolling_vol_window = st.sidebar.selectbox("Rolling Volatility Window", [30, 60, 90, 120], index=1)
+rolling_corr_window = st.sidebar.selectbox("Rolling Correlation Window", [30, 60, 90, 120], index=1)
 
-# ---------------- VALIDATION ----------------
-if len(tickers) < 3 or len(tickers) > 10:
-    st.warning("Please enter between 3 and 10 tickers.")
+# -------------------------------------------------------
+# Validation
+# -------------------------------------------------------
+if len(user_tickers) < 3 or len(user_tickers) > 10:
+    st.error("Please enter between 3 and 10 ticker symbols.")
+    st.stop()
+
+if start_date >= end_date:
+    st.error("Start date must be before end date.")
     st.stop()
 
 if (end_date - start_date).days < 730:
-    st.warning("Minimum 2-year date range required.")
+    st.error("Please select at least a 2-year date range.")
     st.stop()
 
-# ---------------- DATA ----------------
-@st.cache_data(ttl=3600)
+# -------------------------------------------------------
+# Data download
+# -------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_data(tickers, start, end):
     try:
-        data = yf.download(tickers + ["^GSPC"], start=start, end=end, progress=False)
+        raw = yf.download(
+            tickers + [BENCHMARK],
+            start=start,
+            end=end,
+            auto_adjust=False,
+            group_by="column",
+            progress=False,
+            threads=False,
+        )
 
-        if data.empty:
-            return None, ["No data returned"]
+        if raw.empty:
+            return None, ["No data returned from Yahoo Finance."], [], []
 
-        # Handle MultiIndex
-        if isinstance(data.columns, pd.MultiIndex):
-            data = data["Adj Close"]
+        if not isinstance(raw.columns, pd.MultiIndex):
+            return None, ["Unexpected data format returned by yfinance."], [], []
 
-        return data, []
+        level0 = raw.columns.get_level_values(0)
+        if "Adj Close" in level0:
+            prices = raw["Adj Close"].copy()
+        elif "Close" in level0:
+            prices = raw["Close"].copy()
+        else:
+            return None, [f"Expected 'Adj Close' or 'Close' columns. Found: {sorted(set(level0))}"], [], []
+
+        expected = tickers + [BENCHMARK]
+        missing_cols = [c for c in expected if c not in prices.columns]
+        invalid_tickers = missing_cols.copy()
+
+        # Keep only returned columns
+        existing_cols = [c for c in expected if c in prices.columns]
+        prices = prices[existing_cols].sort_index()
+
+        # Drop entirely empty columns
+        all_nan_cols = prices.columns[prices.isna().all()].tolist()
+        invalid_tickers.extend([c for c in all_nan_cols if c != BENCHMARK])
+        prices = prices.drop(columns=all_nan_cols, errors="ignore")
+
+        if BENCHMARK not in prices.columns:
+            return None, ["Benchmark (^GSPC) failed to download."], [], list(dict.fromkeys(invalid_tickers))
+
+        # Missing-value screening for user tickers only
+        asset_cols = [c for c in prices.columns if c != BENCHMARK]
+        missing_fraction = prices[asset_cols].isna().mean()
+        dropped_for_missing = missing_fraction[missing_fraction > 0.05].index.tolist()
+
+        keep_assets = [c for c in asset_cols if c not in dropped_for_missing]
+        keep_cols = keep_assets + [BENCHMARK]
+        prices = prices[keep_cols]
+
+        # Align on common dates across remaining columns
+        prices = prices.dropna(how="any")
+
+        return prices, [], dropped_for_missing, list(dict.fromkeys(invalid_tickers))
 
     except Exception as e:
-        return None, [str(e)]
+        return None, [str(e)], [], []
 
-with st.spinner("Downloading market data..."):
-    prices, errors = load_data(tickers, start_date, end_date)
+with st.spinner("Downloading price data..."):
+    prices, download_errors, dropped_for_missing, invalid_tickers = load_data(user_tickers, start_date, end_date)
 
-if errors:
-    st.error(f"Download error: {errors}")
+if download_errors:
+    st.error("Download error: " + " | ".join(download_errors))
     st.stop()
+
+if invalid_tickers:
+    st.warning("These ticker(s) failed to download or returned no usable data: " + ", ".join(invalid_tickers))
+
+if dropped_for_missing:
+    st.warning(
+        "These ticker(s) were dropped because they had more than 5% missing values over the selected period: "
+        + ", ".join(dropped_for_missing)
+    )
 
 if prices is None or prices.empty:
-    st.error("No valid data returned. Try different tickers.")
+    st.error("No usable price data was returned. Try different tickers or a different date range.")
     st.stop()
 
-# ---------------- CLEAN DATA ----------------
-# Drop columns with >5% missing
-threshold = int(0.95 * len(prices))
-prices = prices.dropna(axis=1, thresh=threshold)
-
-if len(prices.columns) < 3:
-    st.error("Too many tickers had missing data. Need at least 3 valid stocks.")
+asset_cols = [c for c in prices.columns if c != BENCHMARK]
+if len(asset_cols) < 3:
+    st.error("Fewer than 3 valid stock tickers remain after cleaning. Please try different tickers.")
     st.stop()
 
 returns = prices.pct_change().dropna()
+asset_returns = returns[asset_cols]
+benchmark_returns = returns[BENCHMARK]
+all_returns = returns[asset_cols + [BENCHMARK]]
 
-if returns.empty:
-    st.error("Returns calculation failed due to missing data.")
+if asset_returns.empty:
+    st.error("Return calculation failed after data cleaning.")
     st.stop()
 
-# ---------------- FUNCTIONS ----------------
-def ann_return(r): return r.mean() * 252
-def ann_vol(r): return r.std() * np.sqrt(252)
+# -------------------------------------------------------
+# Portfolio calculations
+# -------------------------------------------------------
+mean_returns_annual = asset_returns.mean().values * TRADING_DAYS
+cov_annual = asset_returns.cov().values * TRADING_DAYS
+n_assets = len(asset_cols)
 
-def sharpe(r):
-    return (ann_return(r) - rf_rate) / ann_vol(r)
+equal_weights = np.ones(n_assets) / n_assets
+eq_metrics = build_portfolio_metrics(equal_weights, asset_returns, rf_annual)
 
-def sortino(r):
-    downside = r[r < rf_daily]
-    if len(downside) == 0:
-        return np.nan
-    return (ann_return(r) - rf_rate) / (downside.std() * np.sqrt(252))
+gmv_result = optimize_gmv(cov_annual)
+tan_result = optimize_tangency(mean_returns_annual, cov_annual, rf_annual)
 
-def max_drawdown(r):
-    cum = (1 + r).cumprod()
-    peak = cum.cummax()
-    return ((cum - peak) / peak).min()
+if not gmv_result.success:
+    st.error("Global Minimum Variance optimization failed.")
+    st.stop()
 
-# ---------------- TABS ----------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Returns",
-    "⚠️ Risk",
-    "🔗 Correlation",
-    "📊 Portfolio",
-    "🔍 Sensitivity"
+if not tan_result.success:
+    st.error("Tangency portfolio optimization failed.")
+    st.stop()
+
+gmv_weights = gmv_result.x
+tan_weights = tan_result.x
+
+gmv_metrics = build_portfolio_metrics(gmv_weights, asset_returns, rf_annual)
+tan_metrics = build_portfolio_metrics(tan_weights, asset_returns, rf_annual)
+
+gmv_prc = pd.Series(risk_contribution(gmv_weights, cov_annual), index=asset_cols)
+tan_prc = pd.Series(risk_contribution(tan_weights, cov_annual), index=asset_cols)
+
+frontier_df = efficient_frontier(mean_returns_annual, cov_annual, n_points=40)
+
+# -------------------------------------------------------
+# Tabs
+# -------------------------------------------------------
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Inputs & Data",
+    "Returns & Exploratory Analysis",
+    "Risk Analysis",
+    "Correlation & Covariance",
+    "Portfolio Construction & Optimization",
+    "Estimation Window Sensitivity",
 ])
 
-# =======================
-# RETURNS
-# =======================
+# -------------------------------------------------------
+# Tab 1: Inputs & Data
+# -------------------------------------------------------
 with tab1:
-    st.subheader("Summary Statistics")
+    st.subheader("Data Summary")
 
-    stats = pd.DataFrame({
-        "Return": returns.apply(ann_return),
-        "Volatility": returns.apply(ann_vol),
-        "Sharpe": returns.apply(sharpe),
-        "Sortino": returns.apply(sortino)
+    info_df = pd.DataFrame({
+        "Metric": [
+            "Valid Asset Tickers",
+            "Benchmark",
+            "Start Date",
+            "End Date",
+            "Observations",
+            "Risk-Free Rate",
+        ],
+        "Value": [
+            ", ".join(asset_cols),
+            BENCHMARK,
+            str(prices.index.min().date()),
+            str(prices.index.max().date()),
+            len(prices),
+            f"{rf_annual:.2%}",
+        ],
     })
+    st.dataframe(info_df, use_container_width=True, hide_index=True)
 
-    st.dataframe(stats)
+    st.subheader("Adjusted Close Prices")
+    st.plotly_chart(
+        make_line_chart(prices, "Adjusted Close Prices", "Price"),
+        use_container_width=True
+    )
 
-    st.subheader("Cumulative Wealth ($10,000)")
-    wealth = (1 + returns).cumprod() * 10000
-    st.line_chart(wealth)
+    with st.expander("Preview cleaned price data"):
+        st.dataframe(prices.tail(20), use_container_width=True)
 
-# =======================
-# RISK
-# =======================
+# -------------------------------------------------------
+# Tab 2: Returns & Exploratory Analysis
+# -------------------------------------------------------
 with tab2:
-    window = st.slider("Rolling Vol Window", 30, 120, 60)
+    st.subheader("Summary Statistics")
+    stats_df = summary_stats(all_returns)
+    st.dataframe(stats_df.style.format({
+        "Annualized Mean Return": "{:.2%}",
+        "Annualized Volatility": "{:.2%}",
+        "Skewness": "{:.3f}",
+        "Kurtosis": "{:.3f}",
+        "Min Daily Return": "{:.2%}",
+        "Max Daily Return": "{:.2%}",
+    }), use_container_width=True)
 
-    rolling_vol = returns.rolling(window).std() * np.sqrt(252)
-    st.line_chart(rolling_vol)
+    st.subheader("Cumulative Wealth Index")
+    wealth_selection = st.multiselect(
+        "Choose series to display",
+        options=all_returns.columns.tolist(),
+        default=all_returns.columns.tolist(),
+    )
 
-    stock = st.selectbox("Drawdown Stock", returns.columns)
+    wealth_df = (1 + all_returns[wealth_selection]).cumprod() * 10000 if wealth_selection else pd.DataFrame()
 
-    dd = (1 + returns[stock]).cumprod()
-    dd = (dd - dd.cummax()) / dd.cummax()
-
-    st.line_chart(dd)
-    st.metric("Max Drawdown", f"{dd.min():.2%}")
-
-# =======================
-# CORRELATION
-# =======================
-with tab3:
-    st.subheader("Correlation Matrix")
-    st.dataframe(returns.corr())
-
-    s1 = st.selectbox("Stock 1", returns.columns)
-    s2 = st.selectbox("Stock 2", returns.columns)
-
-    rolling_corr = returns[s1].rolling(60).corr(returns[s2])
-    st.line_chart(rolling_corr)
-
-# =======================
-# PORTFOLIO
-# =======================
-with tab4:
-    mean = returns.mean() * 252
-    cov = returns.cov() * 252
-    n = len(mean)
-
-    bounds = [(0,1)] * n
-    constraints = {'type':'eq','fun':lambda w: np.sum(w)-1}
-    init = np.ones(n)/n
-
-    # GMV
-    def gmv(w): return np.sqrt(w.T @ cov @ w)
-
-    gmv_res = minimize(gmv, init, bounds=bounds, constraints=constraints)
-
-    if not gmv_res.success:
-        st.error("GMV optimization failed")
-        st.stop()
-
-    w_gmv = gmv_res.x
-
-    # Tangency
-    def neg_sharpe(w):
-        ret = np.dot(w, mean)
-        vol = np.sqrt(w.T @ cov @ w)
-        return -(ret - rf_rate)/vol
-
-    tan_res = minimize(neg_sharpe, init, bounds=bounds, constraints=constraints)
-
-    if not tan_res.success:
-        st.error("Tangency optimization failed")
-        st.stop()
-
-    w_tan = tan_res.x
-
-    st.subheader("Tangency Weights")
-    st.write(pd.Series(w_tan, index=returns.columns))
-
-    # Risk contribution
-    port_var = w_tan.T @ cov @ w_tan
-    prc = (w_tan * (cov @ w_tan)) / port_var
-
-    st.subheader("Risk Contribution")
-    st.bar_chart(pd.Series(prc, index=returns.columns))
-
-    # Custom portfolio
-    st.subheader("Custom Portfolio")
-
-    sliders = np.array([
-        st.slider(f"{t}", 0.0, 1.0, 1.0/n)
-        for t in returns.columns
-    ])
-
-    w_custom = sliders / sliders.sum()
-    st.write("Normalized:", pd.Series(w_custom, index=returns.columns))
-
-# =======================
-# SENSITIVITY
-# =======================
-with tab5:
-    st.subheader("Estimation Window Sensitivity")
-
-    options = ["1Y","3Y","5Y","Full"]
-    results = []
-
-    for opt in options:
-        if opt == "Full":
-            sub = returns
-        else:
-            days = int(opt[0]) * 252
-            if len(returns) < days:
-                continue
-            sub = returns.tail(days)
-
-        mean_s = sub.mean() * 252
-        cov_s = sub.cov() * 252
-
-        res = minimize(
-            lambda w: -(np.dot(w, mean_s) - rf_rate)/np.sqrt(w.T@cov_s@w),
-            init,
-            bounds=bounds,
-            constraints=constraints
+    if wealth_df.empty:
+        st.info("Select at least one series to display the cumulative wealth chart.")
+    else:
+        st.plotly_chart(
+            make_line_chart(
+                wealth_df,
+                "Growth of $10,000",
+                "Portfolio Value ($)"
+            ),
+            use_container_width=True
         )
 
-        if res.success:
-            w = res.x
-            r = np.dot(w, mean_s)
-            v = np.sqrt(w.T @ cov_s @ w)
-            s = (r - rf_rate)/v
-            results.append([opt, r, v, s])
+    st.subheader("Distribution Analysis")
+    selected_dist_stock = st.selectbox("Select a stock for distribution analysis", asset_cols)
+    dist_view = st.radio(
+        "Select plot type",
+        options=["Histogram + Normal Curve", "Q-Q Plot"],
+        horizontal=True
+    )
 
-    st.dataframe(pd.DataFrame(results, columns=["Window","Return","Vol","Sharpe"]))
+    stock_ret = asset_returns[selected_dist_stock].dropna()
 
-# ---------------- ABOUT ----------------
-with st.expander("About"):
-    st.write("""
-    - Uses adjusted close prices from Yahoo Finance
-    - Returns are simple (not log)
-    - Annualization uses 252 trading days
-    - No short selling allowed
-    - Optimization via scipy.optimize
-    """)
+    if dist_view == "Histogram + Normal Curve":
+        mu = stock_ret.mean()
+        sigma = stock_ret.std()
+        x_vals = np.linspace(stock_ret.min(), stock_ret.max(), 300)
+        pdf_vals = stats.norm.pdf(x_vals, mu, sigma)
+
+        hist_fig = go.Figure()
+        hist_fig.add_trace(go.Histogram(
+            x=stock_ret,
+            histnorm="probability density",
+            name="Daily Returns",
+            opacity=0.75
+        ))
+        hist_fig.add_trace(go.Scatter(
+            x=x_vals,
+            y=pdf_vals,
+            mode="lines",
+            name="Fitted Normal Curve"
+        ))
+        hist_fig.update_layout(
+            title=f"{selected_dist_stock}: Histogram of Daily Returns with Normal Overlay",
+            xaxis_title="Daily Return",
+            yaxis_title="Density",
+            template="plotly_white",
+            height=500,
+        )
+        st.plotly_chart(hist_fig, use_container_width=True)
+    else:
+        qq = stats.probplot(stock_ret, dist="norm")
+        theoretical = qq[0][0]
+        ordered = qq[0][1]
+        slope = qq[1][0]
+        intercept = qq[1][1]
+
+        qq_fig = go.Figure()
+        qq_fig.add_trace(go.Scatter(
+            x=theoretical,
+            y=ordered,
+            mode="markers",
+            name="Observed Quantiles"
+        ))
+        qq_fig.add_trace(go.Scatter(
+            x=theoretical,
+            y=slope * theoretical + intercept,
+            mode="lines",
+            name="Reference Line"
+        ))
+        qq_fig.update_layout(
+            title=f"{selected_dist_stock}: Q-Q Plot vs Normal",
+            xaxis_title="Theoretical Quantiles",
+            yaxis_title="Ordered Returns",
+            template="plotly_white",
+            height=500,
+        )
+        st.plotly_chart(qq_fig, use_container_width=True)
+
+# -------------------------------------------------------
+# Tab 3: Risk Analysis
+# -------------------------------------------------------
+with tab3:
+    st.subheader("Rolling Annualized Volatility")
+    rolling_vol_df = asset_returns.rolling(rolling_vol_window).std() * np.sqrt(TRADING_DAYS)
+    st.plotly_chart(
+        make_line_chart(
+            rolling_vol_df,
+            f"Rolling Annualized Volatility ({rolling_vol_window}-Day Window)",
+            "Annualized Volatility"
+        ),
+        use_container_width=True
+    )
+
+    st.subheader("Drawdown Analysis")
+    drawdown_stock = st.selectbox("Select a stock for drawdown analysis", asset_cols, key="drawdown_stock")
+    drawdown_wealth = (1 + asset_returns[drawdown_stock]).cumprod()
+    drawdown_peak = drawdown_wealth.cummax()
+    drawdown_series = drawdown_wealth / drawdown_peak - 1
+
+    col_a, col_b = st.columns([1, 3])
+    with col_a:
+        st.metric("Maximum Drawdown", format_pct(drawdown_series.min()))
+    with col_b:
+        dd_fig = go.Figure()
+        dd_fig.add_trace(go.Scatter(x=drawdown_series.index, y=drawdown_series, mode="lines", name=drawdown_stock))
+        dd_fig.update_layout(
+            title=f"{drawdown_stock} Drawdown",
+            xaxis_title="Date",
+            yaxis_title="Drawdown",
+            template="plotly_white",
+            height=450,
+        )
+        st.plotly_chart(dd_fig, use_container_width=True)
+
+    st.subheader("Risk-Adjusted Metrics")
+    risk_df = risk_adjusted_table(all_returns, rf_annual)
+    st.dataframe(risk_df.style.format({
+        "Sharpe Ratio": "{:.3f}",
+        "Sortino Ratio": "{:.3f}",
+    }), use_container_width=True)
+
+# -------------------------------------------------------
+# Tab 4: Correlation & Covariance
+# -------------------------------------------------------
+with tab4:
+    st.subheader("Correlation Heatmap")
+    corr_df = asset_returns.corr()
+
+    heatmap_fig = px.imshow(
+        corr_df,
+        text_auto=".2f",
+        color_continuous_scale="RdBu_r",
+        zmin=-1,
+        zmax=1,
+        aspect="auto",
+        title="Pairwise Correlation Matrix of Daily Returns"
+    )
+    heatmap_fig.update_layout(height=550)
+    st.plotly_chart(heatmap_fig, use_container_width=True)
+
+    st.subheader("Rolling Correlation")
+    c1, c2 = st.columns(2)
+    with c1:
+        stock_1 = st.selectbox("Stock 1", asset_cols, key="rollcorr_s1")
+    with c2:
+        stock_2_choices = [s for s in asset_cols if s != stock_1]
+        stock_2 = st.selectbox("Stock 2", stock_2_choices, key="rollcorr_s2")
+
+    rolling_corr = asset_returns[stock_1].rolling(rolling_corr_window).corr(asset_returns[stock_2])
+
+    rc_fig = go.Figure()
+    rc_fig.add_trace(go.Scatter(x=rolling_corr.index, y=rolling_corr, mode="lines", name=f"{stock_1} vs {stock_2}"))
+    rc_fig.update_layout(
+        title=f"Rolling Correlation: {stock_1} vs {stock_2} ({rolling_corr_window}-Day Window)",
+        xaxis_title="Date",
+        yaxis_title="Correlation",
+        template="plotly_white",
+        height=450,
+    )
+    st.plotly_chart(rc_fig, use_container_width=True)
+
+    with st.expander("Show covariance matrix"):
+        cov_df = asset_returns.cov()
+        st.dataframe(cov_df, use_container_width=True)
+
+# -------------------------------------------------------
+# Tab 5: Portfolio Construction & Optimization
+# -------------------------------------------------------
+with tab5:
+    st.subheader("Equal-Weight Portfolio")
+    eq_display = pd.DataFrame({
+        "Metric": [
+            "Annualized Return",
+            "Annualized Volatility",
+            "Sharpe Ratio",
+            "Sortino Ratio",
+            "Max Drawdown",
+        ],
+        "Value": [
+            eq_metrics["Annualized Return"],
+            eq_metrics["Annualized Volatility"],
+            eq_metrics["Sharpe Ratio"],
+            eq_metrics["Sortino Ratio"],
+            eq_metrics["Max Drawdown"],
+        ]
+    })
+    st.dataframe(eq_display.style.format({"Value": "{:.4f}"}), use_container_width=True, hide_index=True)
+
+    st.subheader("Optimized Portfolios")
+
+    gmv_weights_series = pd.Series(gmv_weights, index=asset_cols, name="GMV Weight")
+    tan_weights_series = pd.Series(tan_weights, index=asset_cols, name="Tangency Weight")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Global Minimum Variance (GMV) Portfolio**")
+        gmv_table = pd.DataFrame({
+            "Metric": [
+                "Annualized Return",
+                "Annualized Volatility",
+                "Sharpe Ratio",
+                "Sortino Ratio",
+                "Max Drawdown",
+            ],
+            "Value": [
+                gmv_metrics["Annualized Return"],
+                gmv_metrics["Annualized Volatility"],
+                gmv_metrics["Sharpe Ratio"],
+                gmv_metrics["Sortino Ratio"],
+                gmv_metrics["Max Drawdown"],
+            ]
+        })
+        st.dataframe(gmv_table.style.format({"Value": "{:.4f}"}), use_container_width=True, hide_index=True)
+        st.plotly_chart(
+            make_bar_chart(gmv_weights_series, "GMV Portfolio Weights", "Weight"),
+            use_container_width=True
+        )
+
+    with col2:
+        st.markdown("**Maximum Sharpe (Tangency) Portfolio**")
+        tan_table = pd.DataFrame({
+            "Metric": [
+                "Annualized Return",
+                "Annualized Volatility",
+                "Sharpe Ratio",
+                "Sortino Ratio",
+                "Max Drawdown",
+            ],
+            "Value": [
+                tan_metrics["Annualized Return"],
+                tan_metrics["Annualized Volatility"],
+                tan_metrics["Sharpe Ratio"],
+                tan_metrics["Sortino Ratio"],
+                tan_metrics["Max Drawdown"],
+            ]
+        })
+        st.dataframe(tan_table.style.format({"Value": "{:.4f}"}), use_container_width=True, hide_index=True)
+        st.plotly_chart(
+            make_bar_chart(tan_weights_series, "Tangency Portfolio Weights", "Weight"),
+            use_container_width=True
+        )
+
+    st.subheader("Risk Contribution (Percentage Risk Contribution, PRC)")
+    st.caption(
+        "PRC shows how much of total portfolio volatility comes from each position. "
+        "A stock can have a smaller weight than another stock but still contribute more risk if it is more volatile or more correlated with the rest of the portfolio."
+    )
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        st.plotly_chart(
+            make_bar_chart(gmv_prc, "GMV Portfolio Risk Contribution", "PRC"),
+            use_container_width=True
+        )
+    with rc2:
+        st.plotly_chart(
+            make_bar_chart(tan_prc, "Tangency Portfolio Risk Contribution", "PRC"),
+            use_container_width=True
+        )
+
+    st.subheader("Custom Portfolio Builder")
+    st.caption("Sliders are normalized so the weights sum to 100%.")
+
+    raw_slider_weights = []
+    custom_cols = st.columns(min(4, n_assets))
+    for i, ticker in enumerate(asset_cols):
+        with custom_cols[i % len(custom_cols)]:
+            raw_val = st.slider(
+                f"{ticker}",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(round(100 / n_assets, 2)),
+                step=1.0,
+                key=f"custom_{ticker}"
+            )
+            raw_slider_weights.append(raw_val)
+
+    raw_slider_weights = np.array(raw_slider_weights, dtype=float)
+    if raw_slider_weights.sum() == 0:
+        custom_weights = np.ones(n_assets) / n_assets
+        st.warning("All slider values were zero, so equal weights were used.")
+    else:
+        custom_weights = raw_slider_weights / raw_slider_weights.sum()
+
+    custom_weights_series = pd.Series(custom_weights, index=asset_cols, name="Custom Weight")
+    custom_metrics = build_portfolio_metrics(custom_weights, asset_returns, rf_annual)
+
+    st.markdown("**Normalized Custom Weights**")
+    st.dataframe(
+        pd.DataFrame({"Weight": custom_weights_series}).style.format({"Weight": "{:.2%}"}),
+        use_container_width=True
+    )
+
+    custom_metrics_df = pd.DataFrame({
+        "Metric": [
+            "Annualized Return",
+            "Annualized Volatility",
+            "Sharpe Ratio",
+            "Sortino Ratio",
+            "Max Drawdown",
+        ],
+        "Value": [
+            custom_metrics["Annualized Return"],
+            custom_metrics["Annualized Volatility"],
+            custom_metrics["Sharpe Ratio"],
+            custom_metrics["Sortino Ratio"],
+            custom_metrics["Max Drawdown"],
+        ]
+    })
+    st.dataframe(custom_metrics_df.style.format({"Value": "{:.4f}"}), use_container_width=True, hide_index=True)
+
+    st.plotly_chart(
+        make_bar_chart(custom_weights_series, "Custom Portfolio Weights", "Weight"),
+        use_container_width=True
+    )
+
+    st.subheader("Efficient Frontier")
+    st.caption(
+        "The efficient frontier shows the highest expected return available for each level of volatility under the no-short-selling constraint. "
+        "The Capital Allocation Line (CAL) starts at the risk-free rate and passes through the tangency portfolio, representing the best risk-return tradeoff when mixing the tangency portfolio with the risk-free asset."
+    )
+
+    frontier_fig = go.Figure()
+
+    if not frontier_df.empty:
+        frontier_fig.add_trace(go.Scatter(
+            x=frontier_df["Volatility"],
+            y=frontier_df["Target Return"],
+            mode="lines",
+            name="Efficient Frontier"
+        ))
+
+    # Individual assets
+    asset_points_x = asset_returns.std().values * np.sqrt(TRADING_DAYS)
+    asset_points_y = asset_returns.mean().values * TRADING_DAYS
+    frontier_fig.add_trace(go.Scatter(
+        x=asset_points_x,
+        y=asset_points_y,
+        mode="markers+text",
+        text=asset_cols,
+        textposition="top center",
+        name="Individual Stocks"
+    ))
+
+    # Benchmark
+    bm_x = annualized_vol(benchmark_returns)
+    bm_y = annualized_return(benchmark_returns)
+    frontier_fig.add_trace(go.Scatter(
+        x=[bm_x], y=[bm_y],
+        mode="markers+text",
+        text=[BENCHMARK],
+        textposition="top center",
+        name="S&P 500 Benchmark",
+        marker=dict(size=10)
+    ))
+
+    # Portfolio points
+    frontier_fig.add_trace(go.Scatter(
+        x=[eq_metrics["Annualized Volatility"]],
+        y=[eq_metrics["Annualized Return"]],
+        mode="markers+text",
+        text=["Equal Weight"],
+        textposition="bottom center",
+        name="Equal Weight",
+        marker=dict(size=11)
+    ))
+
+    frontier_fig.add_trace(go.Scatter(
+        x=[gmv_metrics["Annualized Volatility"]],
+        y=[gmv_metrics["Annualized Return"]],
+        mode="markers+text",
+        text=["GMV"],
+        textposition="bottom center",
+        name="GMV",
+        marker=dict(size=11)
+    ))
+
+    frontier_fig.add_trace(go.Scatter(
+        x=[tan_metrics["Annualized Volatility"]],
+        y=[tan_metrics["Annualized Return"]],
+        mode="markers+text",
+        text=["Tangency"],
+        textposition="bottom center",
+        name="Tangency",
+        marker=dict(size=11)
+    ))
+
+    frontier_fig.add_trace(go.Scatter(
+        x=[custom_metrics["Annualized Volatility"]],
+        y=[custom_metrics["Annualized Return"]],
+        mode="markers+text",
+        text=["Custom"],
+        textposition="bottom center",
+        name="Custom",
+        marker=dict(size=11)
+    ))
+
+    # CAL
+    tan_vol = tan_metrics["Annualized Volatility"]
+    tan_ret = tan_metrics["Annualized Return"]
+    cal_x = np.linspace(0, max(frontier_df["Volatility"].max() if not frontier_df.empty else tan_vol, tan_vol) * 1.15, 50)
+    cal_slope = (tan_ret - rf_annual) / tan_vol if tan_vol != 0 else 0
+    cal_y = rf_annual + cal_slope * cal_x
+
+    frontier_fig.add_trace(go.Scatter(
+        x=cal_x,
+        y=cal_y,
+        mode="lines",
+        name="Capital Allocation Line"
+    ))
+
+    frontier_fig.update_layout(
+        title="Efficient Frontier and Capital Allocation Line",
+        xaxis_title="Annualized Volatility",
+        yaxis_title="Annualized Return",
+        template="plotly_white",
+        height=600,
+    )
+    st.plotly_chart(frontier_fig, use_container_width=True)
+
+    st.subheader("Portfolio Wealth Comparison")
+    comparison_wealth = pd.DataFrame({
+        "Equal Weight": (1 + eq_metrics["Daily Returns"]).cumprod() * 10000,
+        "GMV": (1 + gmv_metrics["Daily Returns"]).cumprod() * 10000,
+        "Tangency": (1 + tan_metrics["Daily Returns"]).cumprod() * 10000,
+        "Custom": (1 + custom_metrics["Daily Returns"]).cumprod() * 10000,
+        "S&P 500": (1 + benchmark_returns).cumprod() * 10000,
+    })
+
+    st.plotly_chart(
+        make_line_chart(
+            comparison_wealth,
+            "Growth of $10,000: Portfolio Comparison",
+            "Portfolio Value ($)"
+        ),
+        use_container_width=True
+    )
+
+    st.subheader("Portfolio Comparison Table")
+    comparison_df = pd.DataFrame({
+        "Annualized Return": [
+            eq_metrics["Annualized Return"],
+            gmv_metrics["Annualized Return"],
+            tan_metrics["Annualized Return"],
+            custom_metrics["Annualized Return"],
+            annualized_return(benchmark_returns),
+        ],
+        "Annualized Volatility": [
+            eq_metrics["Annualized Volatility"],
+            gmv_metrics["Annualized Volatility"],
+            tan_metrics["Annualized Volatility"],
+            custom_metrics["Annualized Volatility"],
+            annualized_vol(benchmark_returns),
+        ],
+        "Sharpe Ratio": [
+            eq_metrics["Sharpe Ratio"],
+            gmv_metrics["Sharpe Ratio"],
+            tan_metrics["Sharpe Ratio"],
+            custom_metrics["Sharpe Ratio"],
+            sharpe_ratio(benchmark_returns, rf_annual),
+        ],
+        "Sortino Ratio": [
+            eq_metrics["Sortino Ratio"],
+            gmv_metrics["Sortino Ratio"],
+            tan_metrics["Sortino Ratio"],
+            custom_metrics["Sortino Ratio"],
+            sortino_ratio(benchmark_returns, rf_annual),
+        ],
+        "Max Drawdown": [
+            eq_metrics["Max Drawdown"],
+            gmv_metrics["Max Drawdown"],
+            tan_metrics["Max Drawdown"],
+            custom_metrics["Max Drawdown"],
+            max_drawdown_from_returns(benchmark_returns),
+        ],
+    }, index=["Equal Weight", "GMV", "Tangency", "Custom", "S&P 500"])
+
+    st.dataframe(comparison_df.style.format({
+        "Annualized Return": "{:.2%}",
+        "Annualized Volatility": "{:.2%}",
+        "Sharpe Ratio": "{:.3f}",
+        "Sortino Ratio": "{:.3f}",
+        "Max Drawdown": "{:.2%}",
+    }), use_container_width=True)
+
+# -------------------------------------------------------
+# Tab 6: Estimation Window Sensitivity
+# -------------------------------------------------------
+with tab6:
+    st.subheader("Estimation Window Sensitivity")
+    st.caption(
+        "Mean-variance optimization is sensitive to the historical inputs used to estimate returns and covariances. "
+        "This section shows how GMV and tangency allocations can change when the lookback window changes."
+    )
+
+    available_options = []
+    total_obs = len(asset_returns)
+
+    if total_obs >= TRADING_DAYS * 1:
+        available_options.append("1 Year")
+    if total_obs >= TRADING_DAYS * 3:
+        available_options.append("3 Years")
+    if total_obs >= TRADING_DAYS * 5:
+        available_options.append("5 Years")
+    available_options.append("Full Sample")
+
+    sens_rows = []
+    weight_rows = []
+
+    for option in available_options:
+        if option == "1 Year":
+            sub = asset_returns.tail(TRADING_DAYS * 1)
+        elif option == "3 Years":
+            sub = asset_returns.tail(TRADING_DAYS * 3)
+        elif option == "5 Years":
+            sub = asset_returns.tail(TRADING_DAYS * 5)
+        else:
+            sub = asset_returns.copy()
+
+        sub_mean = sub.mean().values * TRADING_DAYS
+        sub_cov = sub.cov().values * TRADING_DAYS
+
+        sub_gmv = optimize_gmv(sub_cov)
+        sub_tan = optimize_tangency(sub_mean, sub_cov, rf_annual)
+
+        if sub_gmv.success:
+            gmv_w = sub_gmv.x
+            sens_rows.append({
+                "Window": option,
+                "Portfolio": "GMV",
+                "Annualized Return": portfolio_return(gmv_w, sub_mean),
+                "Annualized Volatility": portfolio_vol(gmv_w, sub_cov),
+                "Sharpe Ratio": np.nan,
+                "Weights": ", ".join([f"{asset_cols[i]}={gmv_w[i]:.2%}" for i in range(len(asset_cols))]),
+            })
+            for i, ticker in enumerate(asset_cols):
+                weight_rows.append({
+                    "Window": option,
+                    "Portfolio": "GMV",
+                    "Ticker": ticker,
+                    "Weight": gmv_w[i],
+                })
+
+        if sub_tan.success:
+            tan_w = sub_tan.x
+            sens_rows.append({
+                "Window": option,
+                "Portfolio": "Tangency",
+                "Annualized Return": portfolio_return(tan_w, sub_mean),
+                "Annualized Volatility": portfolio_vol(tan_w, sub_cov),
+                "Sharpe Ratio": portfolio_sharpe(tan_w, sub_mean, sub_cov, rf_annual),
+                "Weights": ", ".join([f"{asset_cols[i]}={tan_w[i]:.2%}" for i in range(len(asset_cols))]),
+            })
+            for i, ticker in enumerate(asset_cols):
+                weight_rows.append({
+                    "Window": option,
+                    "Portfolio": "Tangency",
+                    "Ticker": ticker,
+                    "Weight": tan_w[i],
+                })
+
+    sensitivity_df = pd.DataFrame(sens_rows)
+    st.dataframe(
+        sensitivity_df.style.format({
+            "Annualized Return": "{:.2%}",
+            "Annualized Volatility": "{:.2%}",
+            "Sharpe Ratio": "{:.3f}",
+        }),
+        use_container_width=True
+    )
+
+    if weight_rows:
+        weights_long = pd.DataFrame(weight_rows)
+
+        chosen_portfolio = st.radio(
+            "Choose portfolio weights to compare across windows",
+            ["GMV", "Tangency"],
+            horizontal=True
+        )
+
+        chart_df = weights_long[weights_long["Portfolio"] == chosen_portfolio]
+
+        sens_fig = px.bar(
+            chart_df,
+            x="Window",
+            y="Weight",
+            color="Ticker",
+            barmode="group",
+            title=f"{chosen_portfolio} Portfolio Weights Across Estimation Windows"
+        )
+        sens_fig.update_layout(
+            xaxis_title="Estimation Window",
+            yaxis_title="Weight",
+            template="plotly_white",
+            height=500,
+        )
+        st.plotly_chart(sens_fig, use_container_width=True)
+
+# -------------------------------------------------------
+# Methodology / About
+# -------------------------------------------------------
+with st.expander("About / Methodology"):
+    st.markdown(
+        """
+**Analytical Methods**
+- Uses daily **simple returns**, not log returns.
+- Annualized return = mean daily return × 252.
+- Annualized volatility = daily standard deviation × √252.
+- Sharpe and Sortino ratios use the user-specified **annualized risk-free rate**.
+- Downside deviation for Sortino uses only returns below the daily risk-free threshold.
+- Cumulative wealth uses `(1 + r).cumprod()`.
+
+**Portfolio Optimization**
+- Optimizations use `scipy.optimize.minimize` with:
+  - no-short-selling bounds `(0, 1)`
+  - full-investment constraint `sum(weights) = 1`
+- GMV minimizes portfolio volatility.
+- Tangency maximizes Sharpe ratio.
+- Efficient frontier is computed by solving a constrained optimization for each target return.
+
+**Risk Contribution**
+- Percentage risk contribution is computed as:
+  - `PRC_i = w_i * (Σw)_i / σ_p²`
+- PRCs sum to approximately 1.
+
+**Data Source**
+- Data comes from Yahoo Finance via `yfinance`.
+- The app uses adjusted closing prices when available.
+        """
+    )
