@@ -293,38 +293,31 @@ def compute_sensitivity(asset_returns: pd.DataFrame, asset_cols: list[str], rf_a
 
 
 # -------------------------------------------------------
-# Sidebar form
+# Sidebar
 # -------------------------------------------------------
 st.sidebar.header("Inputs")
 
 default_start = date.today() - timedelta(days=365 * 5)
 default_end = date.today() - timedelta(days=1)
 
-with st.sidebar.form("input_form"):
-    tickers_input = st.text_input(
-        "Enter 3–10 stock tickers (comma separated)",
-        value="AAPL,MSFT,GOOGL,NVDA"
-    )
+tickers_input = st.sidebar.text_input(
+    "Enter 3–10 stock tickers (comma separated)",
+    value="AAPL,MSFT,GOOGL,NVDA"
+)
 
-    start_date = st.date_input("Start Date", value=default_start, min_value=date(1970, 1, 1))
-    end_date = st.date_input("End Date", value=default_end, min_value=date(1970, 1, 1))
+start_date = st.sidebar.date_input("Start Date", value=default_start, min_value=date(1970, 1, 1))
+end_date = st.sidebar.date_input("End Date", value=default_end, min_value=date(1970, 1, 1))
 
-    rf_annual = st.number_input(
-        "Annual Risk-Free Rate (%)",
-        min_value=0.0,
-        max_value=20.0,
-        value=2.0,
-        step=0.1
-    ) / 100
+rf_annual = st.sidebar.number_input(
+    "Annual Risk-Free Rate (%)",
+    min_value=0.0,
+    max_value=20.0,
+    value=2.0,
+    step=0.1
+) / 100
 
-    rolling_vol_window = st.selectbox("Rolling Volatility Window", [30, 60, 90, 120], index=1)
-    rolling_corr_window = st.selectbox("Rolling Correlation Window", [30, 60, 90, 120], index=1)
-
-    submitted = st.form_submit_button("Update Analysis")
-
-if not submitted:
-    st.info("Set your inputs in the sidebar, then click 'Update Analysis'.")
-    st.stop()
+rolling_vol_window = st.sidebar.selectbox("Rolling Volatility Window", [30, 60, 90, 120], index=1)
+rolling_corr_window = st.sidebar.selectbox("Rolling Correlation Window", [30, 60, 90, 120], index=1)
 
 user_tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
 user_tickers = list(dict.fromkeys(user_tickers))
@@ -388,7 +381,6 @@ def load_data(tickers, start, end):
         all_empty_assets = asset_prices.columns[asset_prices.isna().all()].tolist()
         asset_prices = asset_prices.drop(columns=all_empty_assets, errors="ignore")
 
-        # Retry missing tickers individually
         retried_frames = []
         for tkr in missing_assets:
             try:
